@@ -1,0 +1,7 @@
+telethon==1.36.0
+python-dotenv==1.0.1
+aiohttp==3.9.5
+apscheduler==3.10.4
+sqlite-utils==3.36
+aiogram==3.4.1
+openai==1.30.1
