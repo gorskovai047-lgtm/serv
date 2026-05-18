@@ -2,38 +2,48 @@
 AI-аналитик на базе DeepSeek V4 Pro через Fireworks.ai.
 Даёт конкретные торговые рекомендации по модели Лактионова.
 
-КЛЮЧЕВЫЕ ПРАВИЛА (усвоены из анализа март-май 2026):
+v2.0: Двухэтапные сигналы + Scoring + Реалтайм ТВХ
+
+КЛЮЧЕВЫЕ ПРАВИЛА:
 1. Тейк +0.9-1.5%, стоп ВСЕГДА -0.3%. Либо тейк, либо стоп.
 2. Не более 8 сделок за день.
-3. Вход с открытия (07:00 срочка / 10:00 ОС) на первых барах.
-4. Выход при ATR 1% или по 1-й цели.
+3. Вход с открытия на первых 5-мин барах (с подтверждением!).
+4. Выход при ATR 1% или по 1-й цели. НЕ ЖОПИТЬ.
 5. Не торгуем после 14:00 МСК.
 6. Мин объём 300 млн руб.
-7. НЕ шортить вчерашних лидеров падения (импульс уже отработан).
+7. НЕ шортить вчерашних лидеров падения.
 8. НЕ лонговать вчерашних лидеров роста.
-9. Если Лактионов пишет "лонг" для тикера, но общий план ШОРТ —
-   это НЕ рекомендация лонга! Это значит тикер выглядит лонгово
-   (закрылся зелёным баром), и при ПРОБОЕ поддержки он становится
-   кандидатом на контртрендовый ШОРТ.
-10. 80% сделок Лактионова = шорт. При отсутствии драйвера = шорт.
-11. Паранорм бары (ход > 2%) = 80% вероятность отката/проторговки следующий день.
-12. Больше сделок (6-7) = лучшая диверсификация риска.
+9. Контртренд: "лонг" в плане + общий шорт = шорт при пробое.
+10. Качество > количество. Scoring каждой сделки.
 """
 
+import re
 import json
 import os
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from enum import Enum
 
 MSK = timezone(timedelta(hours=3))
 
-# Fireworks.ai настройки
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
 FIREWORKS_MODEL = os.getenv(
     "FIREWORKS_MODEL", "accounts/fireworks/models/deepseek-v4-pro"
 )
 FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
+
+
+class TradeStatus(Enum):
+    """Статус сделки."""
+    PLANNED = "planned"          # План (до открытия)
+    WAITING_CONFIRM = "waiting"  # Ждёт подтверждения первым баром
+    CONFIRMED = "confirmed"      # Подтверждена — можно входить
+    ACTIVE = "active"            # В работе
+    TAKE_PROFIT = "take"         # Закрыта по тейку
+    STOP_LOSS = "stop"           # Закрыта по стопу
+    CANCELLED = "cancelled"      # Отменена (первый бар против)
+    EXPIRED = "expired"          # Истекла (после 14:00)
 
 
 class AIAnalyst:
@@ -44,9 +54,11 @@ class AIAnalyst:
         self.model = FIREWORKS_MODEL
         self.today_trades: List[Dict] = []
         self.daily_direction: Optional[str] = None
+        self.daily_logic: str = ""
         self.max_trades_per_day = 8
+        self._confirmed_trades: List[Dict] = []
 
-    def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 1500) -> str:
+    def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 2500) -> str:
         """Вызов DeepSeek V4 Pro через Fireworks.ai."""
         if not self.api_key:
             return "[ОШИБКА] Нет FIREWORKS_API_KEY"
@@ -77,7 +89,91 @@ class AIAnalyst:
         except Exception as e:
             return f"[ОШИБКА LLM] {e}"
 
-    def morning_analysis(
+
+
+    # ═══════════════════════════════════════════════════
+    # SCORING СИСТЕМА
+    # ═══════════════════════════════════════════════════
+
+    def _score_trade(
+        self,
+        trade: Dict,
+        channel_data: Dict,
+        market_data: Dict,
+        prev_moves: Dict,
+        paranorm_bars: List[str],
+    ) -> int:
+        """
+        Оценка качества сделки (1-5 звёзд).
+        
+        Факторы (+1 каждый):
+        1. Лактионов ЯВНО пометил тикер как шорт/лонг
+        2. Тикер хуже/лучше рынка (совпадает с направлением)
+        3. Паранорм бар вчера (откат ожидается)
+        4. Фон совпадает с направлением
+        5. Контртренд-ловушка (лонг в шортовый день = пробой)
+        """
+        score = 0
+        ticker = trade["ticker"]
+        direction = trade["direction"]
+        channel_text = channel_data.get("raw_text", "").lower()
+
+        # 1. Лактионов явно пометил тикер
+        ticker_aliases = {
+            "SBER": ["сбер"], "VTBR": ["втб"], "GAZP": ["газпром", "гп"],
+            "LKOH": ["лукойл", "лук"], "ROSN": ["роснефть"],
+            "GMKN": ["гмк", "норникель"], "NVTK": ["новатэк"],
+            "OZON": ["озон"], "TCSG": ["тиньков", "тинькофф"],
+            "AFLT": ["аэрофлот"], "MAGN": ["ммк"], "NLMK": ["нлмк"],
+            "MGNT": ["магнит"], "ALRS": ["алроса"], "TATN": ["татнефть"],
+        }
+        aliases = ticker_aliases.get(ticker, [ticker.lower()])
+        dir_word = "шорт" if direction == "SHORT" else "лонг"
+        for alias in aliases:
+            if alias in channel_text and dir_word in channel_text:
+                score += 1
+                break
+
+        # 2. Хуже/лучше рынка
+        if ticker in prev_moves:
+            imoex_move = prev_moves.get("IMOEX", 0)
+            ticker_move = prev_moves[ticker]
+            relative = ticker_move - imoex_move
+            if direction == "SHORT" and relative < -0.5:
+                score += 1  # Хуже рынка = хорош для шорта
+            elif direction == "LONG" and relative > 0.5:
+                score += 1  # Лучше рынка = хорош для лонга
+
+        # 3. Паранорм бар вчера по этому тикеру
+        for pb in paranorm_bars:
+            if ticker in pb:
+                score += 1
+                break
+
+        # 4. Фон совпадает с направлением
+        oil = market_data.get("oil_change", "")
+        if direction == "SHORT" and ("-" in oil or "минус" in str(market_data.get("global_indices", ""))):
+            score += 1
+        elif direction == "LONG" and ("+" in oil):
+            score += 1
+
+        # 5. Контртренд-ловушка
+        if direction == "SHORT":
+            for alias in aliases:
+                if alias in channel_text and "лонг" in channel_text:
+                    # Тикер помечен как "лонг" но мы шортим = контртренд
+                    score += 1
+                    break
+
+        return min(score + 1, 5)  # Минимум 1 звезда, макс 5
+
+
+
+    # ═══════════════════════════════════════════════════
+    # ЭТАП 1: УТРЕННИЙ ПЛАН (06:45 МСК — за 15 мин до открытия)
+    # ═══════════════════════════════════════════════════
+
+    def morning_plan(
         self,
         channel_data: Dict,
         market_data: Dict,
@@ -85,15 +181,10 @@ class AIAnalyst:
         paranorm_bars: List[str],
     ) -> Dict:
         """
-        Утренний анализ (06:00 МСК). Определяет направление дня и сделки.
-
-        Args:
-            channel_data: Данные из канала Лактионова (уровни, план)
-            market_data: Текущий фон (нефть, фьючерсы, товарка)
-            previous_day_data: Данные предыдущего торгового дня (O/H/L/C по тикерам)
-            paranorm_bars: Список тикеров с паранорм барами вчера (ход > 2%)
+        Этап 1: Утренний план (06:45 МСК).
+        Определяет направление дня и ПЛАН сделок (ещё не подтверждённых).
+        Сигнал приходит за 15 минут до открытия срочного рынка.
         """
-        # Определяем вчерашних лидеров падения/роста
         prev_moves = {}
         for ticker, data in previous_day_data.items():
             if data.get("open") and data["open"] > 0:
@@ -103,53 +194,238 @@ class AIAnalyst:
         yesterday_fallers = [t for t, m in prev_moves.items() if m < -1.5]
         yesterday_risers = [t for t, m in prev_moves.items() if m > 1.5]
 
-        # Формируем промпт
         system_prompt = self._get_system_prompt()
-
         user_prompt = self._format_morning_prompt(
             channel_data, market_data, prev_moves,
             yesterday_fallers, yesterday_risers, paranorm_bars
         )
 
-        # Вызываем LLM
-        response = self._call_llm(system_prompt, user_prompt, max_tokens=2000)
-
-        # Парсим ответ
+        response = self._call_llm(system_prompt, user_prompt, max_tokens=2500)
         trades = self._parse_trades_from_response(response)
-
-        # Фильтруем сделки по правилам
         filtered_trades = self._filter_trades(
             trades, yesterday_fallers, yesterday_risers, previous_day_data
         )
 
-        self.today_trades = filtered_trades[:self.max_trades_per_day]
+        # Scoring каждой сделки
+        for trade in filtered_trades:
+            trade["score"] = self._score_trade(
+                trade, channel_data, market_data, prev_moves, paranorm_bars
+            )
+            trade["status"] = TradeStatus.PLANNED.value
+
+        # Сортируем по score (лучшие сверху)
+        filtered_trades.sort(key=lambda x: x["score"], reverse=True)
+
+        # Берём только лучшие (score >= 2)
+        quality_trades = [t for t in filtered_trades if t["score"] >= 2]
+        if not quality_trades:
+            quality_trades = filtered_trades[:3]  # Хотя бы 3 если все слабые
+
+        self.today_trades = quality_trades[:self.max_trades_per_day]
         self.daily_direction = self._determine_direction(response)
+        self.daily_logic = self._extract_logic(response)
 
         return {
             "direction": self.daily_direction,
+            "logic": self.daily_logic,
             "trades": self.today_trades,
             "analysis": response,
-            "filtered_out": len(trades) - len(filtered_trades),
+            "filtered_out": len(trades) - len(quality_trades),
+            "stage": "PLAN",
         }
 
-    def intraday_check(
+    # ═══════════════════════════════════════════════════
+    # ЭТАП 2: ПОДТВЕРЖДЕНИЕ ПЕРВЫМ БАРОМ (07:05 / 10:05)
+    # ═══════════════════════════════════════════════════
+
+    def confirm_by_first_bar(self, first_bar_data: Dict) -> List[Dict]:
+        """
+        Этап 2: Подтверждение первым 5-мин баром.
+        
+        Args:
+            first_bar_data: {ticker: {"open": x, "close": y, "high": z, "low": w}}
+        
+        Returns:
+            Список подтверждённых/отменённых сделок
+        """
+        confirmed = []
+        cancelled = []
+
+        for trade in self.today_trades:
+            if trade["status"] != TradeStatus.PLANNED.value:
+                continue
+
+            ticker = trade["ticker"]
+            direction = trade["direction"]
+
+            if ticker not in first_bar_data:
+                # Нет данных — оставляем в плане
+                trade["status"] = TradeStatus.WAITING_CONFIRM.value
+                continue
+
+            bar = first_bar_data[ticker]
+            bar_open = bar["open"]
+            bar_close = bar["close"]
+            bar_direction = "DOWN" if bar_close < bar_open else "UP"
+
+            # Подтверждение: первый бар в нашу сторону
+            if direction == "SHORT" and bar_direction == "DOWN":
+                trade["status"] = TradeStatus.CONFIRMED.value
+                trade["entry"] = bar_close  # Входим по закрытию 1-го бара
+                trade["take"] = round(bar_close * 0.989, 2)
+                trade["stop"] = round(bar_close * 1.003, 2)
+                confirmed.append(trade)
+
+            elif direction == "LONG" and bar_direction == "UP":
+                trade["status"] = TradeStatus.CONFIRMED.value
+                trade["entry"] = bar_close
+                trade["take"] = round(bar_close * 1.011, 2)
+                trade["stop"] = round(bar_close * 0.997, 2)
+                confirmed.append(trade)
+
+            else:
+                # Первый бар ПРОТИВ нашего направления
+                # Не отменяем сразу — ждём ещё 1 бар (может быть ложный)
+                trade["status"] = TradeStatus.WAITING_CONFIRM.value
+                trade["_against_count"] = trade.get("_against_count", 0) + 1
+
+                if trade["_against_count"] >= 2:
+                    # 2 бара против — отменяем
+                    trade["status"] = TradeStatus.CANCELLED.value
+                    cancelled.append(trade)
+
+        self._confirmed_trades = confirmed
+        return confirmed
+
+
+
+    # ═══════════════════════════════════════════════════
+    # РЕАЛТАЙМ ТВХ (во время сессии)
+    # ═══════════════════════════════════════════════════
+
+    def check_realtime_entry(
         self,
         current_prices: Dict,
+        levels: List[Dict],
         atr_status: Dict,
         time_msk: datetime,
     ) -> List[Dict]:
         """
-        Интрадей проверка (каждые 5-10 минут).
-        Возвращает список сигналов если есть.
+        Проверка реалтайм ТВХ при пробоях уровней.
+        Вызывается каждые 30-60 секунд.
+        
+        Генерирует НЕМЕДЛЕННЫЙ сигнал если:
+        1. Цена пробивает уровень поддержки/сопротивления
+        2. Направление совпадает с дневным планом
+        3. ATR инструмента < 70% (ещё есть потенциал хода)
+        4. Время до 14:00 МСК
         """
         signals = []
         hour = time_msk.hour
 
-        # После 14:00 — не рекомендуем новые входы
+        # После 14:00 — не ищем ТВХ
         if hour >= 14:
             return signals
 
+        # Не генерируем если нет направления
+        if not self.daily_direction or self.daily_direction == "FENCE":
+            return signals
+
+        for level in levels:
+            ticker = level.get("ticker", "")
+            level_price = level.get("price", 0)
+            level_type = level.get("level_type", "")
+
+            if not ticker or ticker not in current_prices or not level_price:
+                continue
+
+            price = current_prices[ticker]
+
+            # Проверяем ATR — если уже пройден > 70%, не входим
+            ticker_atr = atr_status.get(ticker, {})
+            atr_used_pct = ticker_atr.get("atr_used_pct", 0)
+            if atr_used_pct > 70:
+                continue
+
+            # Проверяем не открыта ли уже сделка по этому тикеру
+            active_tickers = [t["ticker"] for t in self.today_trades
+                            if t["status"] in (TradeStatus.CONFIRMED.value, TradeStatus.ACTIVE.value)]
+            if ticker in active_tickers:
+                continue
+
+            # Лимит сделок
+            active_count = len([t for t in self.today_trades
+                              if t["status"] in (TradeStatus.CONFIRMED.value, TradeStatus.ACTIVE.value)])
+            if active_count >= self.max_trades_per_day:
+                continue
+
+            # ПРОБОЙ ПОДДЕРЖКИ ВНИЗ → ШОРТ (если дневной план = шорт)
+            if (level_type == "support"
+                    and price < level_price * 0.998  # Пробой на 0.2%+
+                    and self.daily_direction == "SHORT"):
+
+                entry = price
+                signal = {
+                    "type": "REALTIME_ENTRY",
+                    "direction": "SHORT",
+                    "ticker": ticker,
+                    "entry": entry,
+                    "take": round(entry * 0.989, 2),
+                    "stop": round(entry * 1.003, 2),
+                    "reason": f"Пробой поддержки {level_price:.2f} вниз",
+                    "atr_remaining": f"{100 - atr_used_pct:.0f}%",
+                    "time": time_msk.strftime("%H:%M"),
+                }
+                signals.append(signal)
+
+                # Добавляем в today_trades
+                self.today_trades.append({
+                    **signal,
+                    "status": TradeStatus.ACTIVE.value,
+                    "score": 3,  # Пробой = автоматически 3 звезды
+                })
+
+            # ПРОБОЙ СОПРОТИВЛЕНИЯ ВВЕРХ → ЛОНГ (если дневной план = лонг)
+            elif (level_type == "resistance"
+                  and price > level_price * 1.002
+                  and self.daily_direction == "LONG"):
+
+                entry = price
+                signal = {
+                    "type": "REALTIME_ENTRY",
+                    "direction": "LONG",
+                    "ticker": ticker,
+                    "entry": entry,
+                    "take": round(entry * 1.011, 2),
+                    "stop": round(entry * 0.997, 2),
+                    "reason": f"Пробой сопротивления {level_price:.2f} вверх",
+                    "atr_remaining": f"{100 - atr_used_pct:.0f}%",
+                    "time": time_msk.strftime("%H:%M"),
+                }
+                signals.append(signal)
+
+                self.today_trades.append({
+                    **signal,
+                    "status": TradeStatus.ACTIVE.value,
+                    "score": 3,
+                })
+
+        return signals
+
+
+
+    # ═══════════════════════════════════════════════════
+    # МОНИТОРИНГ ТЕЙКОВ/СТОПОВ АКТИВНЫХ СДЕЛОК
+    # ═══════════════════════════════════════════════════
+
+    def check_active_trades(self, current_prices: Dict) -> List[Dict]:
+        """Проверяет активные сделки на тейк/стоп."""
+        signals = []
+
         for trade in self.today_trades:
+            if trade["status"] not in (TradeStatus.CONFIRMED.value, TradeStatus.ACTIVE.value):
+                continue
+
             ticker = trade["ticker"]
             if ticker not in current_prices:
                 continue
@@ -160,65 +436,101 @@ class AIAnalyst:
             stop = trade["stop"]
             direction = trade["direction"]
 
-            # Проверяем тейк
-            if direction == "SHORT" and price <= take:
-                signals.append({
-                    "type": "TAKE_PROFIT",
-                    "ticker": ticker,
-                    "price": price,
-                    "pnl": (entry - price) / entry * 100,
-                })
-            elif direction == "LONG" and price >= take:
-                signals.append({
-                    "type": "TAKE_PROFIT",
-                    "ticker": ticker,
-                    "price": price,
-                    "pnl": (price - entry) / entry * 100,
-                })
-
-            # Проверяем стоп
-            if direction == "SHORT" and price >= stop:
-                signals.append({
-                    "type": "STOP_LOSS",
-                    "ticker": ticker,
-                    "price": price,
-                    "pnl": -((price - entry) / entry * 100),
-                })
-            elif direction == "LONG" and price <= stop:
-                signals.append({
-                    "type": "STOP_LOSS",
-                    "ticker": ticker,
-                    "price": price,
-                    "pnl": -((entry - price) / entry * 100),
-                })
+            if direction == "SHORT":
+                if price <= take:
+                    trade["status"] = TradeStatus.TAKE_PROFIT.value
+                    pnl = (entry - price) / entry * 100
+                    signals.append({"type": "TAKE_PROFIT", "ticker": ticker, "pnl": pnl, "price": price})
+                elif price >= stop:
+                    trade["status"] = TradeStatus.STOP_LOSS.value
+                    pnl = -((price - entry) / entry * 100)
+                    signals.append({"type": "STOP_LOSS", "ticker": ticker, "pnl": pnl, "price": price})
+            else:  # LONG
+                if price >= take:
+                    trade["status"] = TradeStatus.TAKE_PROFIT.value
+                    pnl = (price - entry) / entry * 100
+                    signals.append({"type": "TAKE_PROFIT", "ticker": ticker, "pnl": pnl, "price": price})
+                elif price <= stop:
+                    trade["status"] = TradeStatus.STOP_LOSS.value
+                    pnl = -((entry - price) / entry * 100)
+                    signals.append({"type": "STOP_LOSS", "ticker": ticker, "pnl": pnl, "price": price})
 
         return signals
 
-    def evening_summary(self, day_results: Dict) -> str:
-        """Вечерний итог дня + паранорм бары на завтра."""
-        system_prompt = (
-            "Ты аналитик интрадея ММВБ. Подведи итоги дня кратко. "
-            "Укажи паранорм бары (ход > 2%) и что это значит на завтра."
-        )
+    # ═══════════════════════════════════════════════════
+    # ФОРМАТИРОВАНИЕ СООБЩЕНИЙ
+    # ═══════════════════════════════════════════════════
 
-        user_prompt = f"""Результаты дня:
-{json.dumps(day_results, ensure_ascii=False, indent=2)}
+    def format_plan_message(self) -> str:
+        """Форматирует ПЛАН (этап 1) для Telegram."""
+        if not self.today_trades:
+            return "🤖 Нет сделок на сегодня"
 
-Формат ответа:
-1. Итоги дня (2-3 строки)
-2. Паранорм бары (тикеры с ходом > 2%)
-3. Что это значит на завтра
-4. Предварительный план на завтра (1 строка)"""
+        dir_emoji = {"SHORT": "🔴", "LONG": "🟢", "FENCE": "🟡"}
+        dir_text = {"SHORT": "ШОРТ", "LONG": "ЛОНГ", "FENCE": "ЗАБОР"}
+        stars = {1: "★", 2: "★★", 3: "★★★", 4: "★★★★", 5: "★★★★★"}
 
-        return self._call_llm(system_prompt, user_prompt, max_tokens=800)
+        msg = "🤖 <b>ПЛАН НА СЕССИЮ</b> (ждём подтверждения)\n\n"
+        msg += f"Направление: {dir_emoji.get(self.daily_direction, '⚪')} "
+        msg += f"<b>{dir_text.get(self.daily_direction, '?')}</b>\n"
+        if self.daily_logic:
+            msg += f"Логика: <i>{self.daily_logic}</i>\n\n"
+
+        for i, trade in enumerate(self.today_trades, 1):
+            d = "🔴" if trade["direction"] == "SHORT" else "🟢"
+            score = trade.get("score", 1)
+            ticker = trade["ticker"]
+            entry = trade["entry"]
+            take = trade["take"]
+            stop = trade["stop"]
+
+            msg += f"{d} <b>{ticker}</b> {stars.get(score, '★')} "
+            msg += f"{'ШОРТ' if trade['direction'] == 'SHORT' else 'ЛОНГ'}\n"
+            msg += f"   Вход: ~{entry} | Тейк: {take} | Стоп: {stop}\n"
+            msg += f"   <i>Статус: ожидает подтверждения 1-м баром</i>\n\n"
+
+        msg += "⏳ <b>Подтверждение придёт через 5 мин после открытия</b>"
+        return msg
+
+    def format_confirmation_message(self, confirmed: List[Dict]) -> str:
+        """Форматирует ПОДТВЕРЖДЕНИЕ (этап 2)."""
+        if not confirmed:
+            return "⚠️ Ни одна сделка не подтверждена первым баром. Жду следующий бар."
+
+        msg = "✅ <b>ПОДТВЕРЖДЕНИЕ — ВХОДИМ!</b>\n\n"
+        for trade in confirmed:
+            d = "🔴" if trade["direction"] == "SHORT" else "🟢"
+            msg += f"{d} <b>{trade['ticker']}</b> "
+            msg += f"{'ШОРТ' if trade['direction'] == 'SHORT' else 'ЛОНГ'}\n"
+            msg += f"   Вход: {trade['entry']} | Тейк: {trade['take']} | Стоп: {trade['stop']}\n"
+            msg += f"   ✅ Первый бар подтвердил направление\n\n"
+
+        return msg
+
+    def format_realtime_signal(self, signal: Dict) -> str:
+        """Форматирует реалтайм ТВХ."""
+        d = "🔴" if signal["direction"] == "SHORT" else "🟢"
+        msg = f"⚡ <b>РЕАЛТАЙМ ТВХ ({signal['time']})</b>\n\n"
+        msg += f"{d} <b>{signal['ticker']}</b> "
+        msg += f"{'ШОРТ' if signal['direction'] == 'SHORT' else 'ЛОНГ'}\n"
+        msg += f"   Вход: {signal['entry']} | Тейк: {signal['take']} | Стоп: {signal['stop']}\n"
+        msg += f"   Причина: {signal['reason']}\n"
+        msg += f"   ATR остаток: {signal['atr_remaining']}\n"
+        return msg
+
+
+
+    # ═══════════════════════════════════════════════════
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # ═══════════════════════════════════════════════════
 
     def _get_system_prompt(self) -> str:
-        """Системный промпт с полной моделью Лактионова."""
+        """Системный промпт с моделью Лактионова."""
         return """Ты интрадей-аналитик ММВБ. Торгуешь строго по модели Лактионова (280 сделок, 81% винрейт).
 
 ЖЕЛЕЗНЫЕ ПРАВИЛА:
 1. Тейк: +0.9-1.5%. Стоп: ВСЕГДА -0.3%. Либо тейк, либо стоп.
-2. Максимум 6-7 сделок за день (не менее 4 для диверсификации).
+2. Качество важнее количества. Лучше 3 сделки на ★★★★★ чем 7 на ★★.
 3. Вход с ОТКРЫТИЯ на первых 5-минутных барах.
 4. Выход по 1-й цели или при ATR 1%. НЕ ЖОПИТЬ.
 5. Не торгуем после 14:00 МСК.
@@ -228,7 +540,7 @@ class AIAnalyst:
 - Нет драйвера роста + спеклонг → ШОРТ (80% сделок)
 - Паранорм бары вчера вниз + нет негатива → ЛОНГ
 - Фон негативный + индексы минус + товарка минус → ШОРТ
-- Нефть растёт но рынок НЕ реагирует → РАСХОЖДЕНИЕ = ШОРТ (рынок прав, нефть догонит)
+- Нефть растёт но рынок НЕ реагирует → РАСХОЖДЕНИЕ = ШОРТ
 
 КРИТИЧЕСКИЕ ПРАВИЛА ОТБОРА ИНСТРУМЕНТОВ:
 - НИКОГДА не шорти вчерашних лидеров падения (> -1.5%). Импульс отработан!
@@ -239,82 +551,65 @@ class AIAnalyst:
 ВАЖНО О КОНТРТРЕНДЕ:
 Когда Лактионов пишет "ВТБ 91 лонг под 90-89" но общий план = ШОРТ:
 - Это НЕ значит "покупай ВТБ"!
-- Это значит: ВТБ закрылся зелёным баром (ВЫГЛЯДИТ лонгово)
-- При ПРОБОЕ поддержки 90 = ШОРТ (контртренд, ловушка для лонгистов)
+- Это значит: ВТБ выглядит лонгово (зелёный бар)
+- При ПРОБОЕ поддержки 90 = ШОРТ (контртренд, ловушка)
 - Такие тикеры — ПРИОРИТЕТ для шорта при пробое!
 
 ФОРМАТ ОТВЕТА (СТРОГО):
 НАПРАВЛЕНИЕ: [ШОРТ/ЛОНГ/ЗАБОР]
-ЛОГИКА: [2-3 предложения]
+ЛОГИКА: [1-2 предложения почему именно это направление]
 СДЕЛКА 1: [ШОРТ/ЛОНГ] [ТИКЕР] от [ЦЕНА], тейк [ЦЕНА], стоп [ЦЕНА]
 СДЕЛКА 2: ...
-...
 НЕ ТОРГУЕМ: [тикеры и причины]
 
-Дай 5-7 сделок. НЕ пиши ничего лишнего."""
+Дай 4-6 ЛУЧШИХ сделок. Качество > количество."""
 
     def _format_morning_prompt(
-        self,
-        channel_data: Dict,
-        market_data: Dict,
-        prev_moves: Dict,
-        yesterday_fallers: List[str],
-        yesterday_risers: List[str],
-        paranorm_bars: List[str],
+        self, channel_data, market_data, prev_moves,
+        yesterday_fallers, yesterday_risers, paranorm_bars
     ) -> str:
-        """Формирует утренний промпт с данными."""
-
-        # Форматируем данные канала
-        channel_text = channel_data.get("raw_text", "Нет данных из канала")
+        """Формирует утренний промпт."""
+        channel_text = channel_data.get("raw_text", "Нет данных")
         levels_text = channel_data.get("levels_text", "")
 
-        # Форматируем предыдущий день
         prev_day_text = "ПРЕДЫДУЩИЙ ДЕНЬ:\n"
         sorted_moves = sorted(prev_moves.items(), key=lambda x: x[1])
         for ticker, move in sorted_moves[:5]:
-            prev_day_text += f"  {ticker}: {move:+.2f}% {'⚠️ ЛИДЕР ПАДЕНИЯ' if move < -1.5 else ''}\n"
+            prev_day_text += f"  {ticker}: {move:+.2f}%{' ⚠️ЛИДЕР ПАДЕНИЯ' if move < -1.5 else ''}\n"
         prev_day_text += "  ...\n"
         for ticker, move in sorted_moves[-5:]:
-            prev_day_text += f"  {ticker}: {move:+.2f}% {'⚠️ ЛИДЕР РОСТА' if move > 1.5 else ''}\n"
+            prev_day_text += f"  {ticker}: {move:+.2f}%{' ⚠️ЛИДЕР РОСТА' if move > 1.5 else ''}\n"
 
-        # Паранорм бары
         paranorm_text = "Нет" if not paranorm_bars else ", ".join(paranorm_bars)
 
-        prompt = f"""ДАТА: {datetime.now(MSK).strftime('%d.%m.%Y')} (утро, 06:50 МСК)
+        return f"""ДАТА: {datetime.now(MSK).strftime('%d.%m.%Y')} (06:45 МСК, за 15 мин до открытия)
 
-АНАЛИТИКА ИЗ КАНАЛА ЛАКТИОНОВА:
-{channel_text}
+АНАЛИТИКА ЛАКТИОНОВА:
+{channel_text[:2500]}
 
 УРОВНИ:
-{levels_text}
+{levels_text[:1500]}
 
-ФОН НА ОТКРЫТИЕ:
-- Нефть Brent: {market_data.get('oil_change', '?')}
-- Фьючерс ММВБ (MXM): {market_data.get('mx_price', '?')}
+ФОН:
+- Нефть: {market_data.get('oil_change', '?')}
+- Фьючерс ММВБ: {market_data.get('mx_price', '?')}
 - Золото: {market_data.get('gold_change', '?')}
 - USD/RUB: {market_data.get('usd_change', '?')}
-- Индексы мировые: {market_data.get('global_indices', '?')}
 
 {prev_day_text}
 
-ПАРАНОРМ БАРЫ ВЧЕРА (ход > 2%): {paranorm_text}
+ПАРАНОРМ БАРЫ ВЧЕРА: {paranorm_text}
+⚠️ НЕ ШОРТИТЬ: {', '.join(yesterday_fallers) if yesterday_fallers else 'нет'}
+⚠️ НЕ ЛОНГОВАТЬ: {', '.join(yesterday_risers) if yesterday_risers else 'нет'}
 
-⚠️ НЕ ШОРТИТЬ (вчера уже упали > 1.5%): {', '.join(yesterday_fallers) if yesterday_fallers else 'нет'}
-⚠️ НЕ ЛОНГОВАТЬ (вчера уже выросли > 1.5%): {', '.join(yesterday_risers) if yesterday_risers else 'нет'}
-
-ЗАДАЧА: Дай конкретные сделки на открытие. 5-7 штук.
-Помни: если тикер помечен "лонг" но общий план ШОРТ = это контртренд, шорти при пробое поддержки."""
-
-        return prompt
+ЗАДАЧА: Дай 4-6 ЛУЧШИХ сделок. Качество важнее количества.
+Помни контртренд: "лонг" в плане + общий ШОРТ = шорти при пробое поддержки."""
 
     def _parse_trades_from_response(self, response: str) -> List[Dict]:
         """Парсит сделки из ответа LLM."""
         trades = []
-        lines = response.split("\n")
-
-        for line in lines:
+        for line in response.split("\n"):
             line = line.strip()
-            # Ищем строки вида: СДЕЛКА N: ШОРТ TICKER от PRICE, тейк PRICE, стоп PRICE
             match = re.search(
                 r'(?:СДЕЛКА\s*\d*:?\s*)?(ШОРТ|ЛОНГ|SHORT|LONG)\s+'
                 r'(\w+)\s+от\s+([\d.,]+).*?'
@@ -324,123 +619,65 @@ class AIAnalyst:
             )
             if match:
                 direction = "SHORT" if match.group(1).upper() in ("ШОРТ", "SHORT") else "LONG"
-                ticker = match.group(2).upper()
-                entry = float(match.group(3).replace(",", "."))
-                take = float(match.group(4).replace(",", "."))
-                stop = float(match.group(5).replace(",", "."))
-
                 trades.append({
                     "direction": direction,
-                    "ticker": ticker,
-                    "entry": entry,
-                    "take": take,
-                    "stop": stop,
+                    "ticker": match.group(2).upper(),
+                    "entry": float(match.group(3).replace(",", ".")),
+                    "take": float(match.group(4).replace(",", ".")),
+                    "stop": float(match.group(5).replace(",", ".")),
                 })
-
         return trades
 
-    def _filter_trades(
-        self,
-        trades: List[Dict],
-        yesterday_fallers: List[str],
-        yesterday_risers: List[str],
-        previous_day_data: Dict,
-    ) -> List[Dict]:
-        """
-        Фильтрует сделки по правилам:
-        - Не шортить вчерашних лидеров падения
-        - Не лонговать вчерашних лидеров роста
-        - Проверить корректность тейка/стопа
-        """
+    def _filter_trades(self, trades, yesterday_fallers, yesterday_risers, previous_day_data):
+        """Фильтрует сделки по правилам."""
         filtered = []
-
         for trade in trades:
             ticker = trade["ticker"]
             direction = trade["direction"]
 
-            # Правило: НЕ шортить то что вчера уже упало сильно
             if direction == "SHORT" and ticker in yesterday_fallers:
-                print(f"[AI] ФИЛЬТР: {ticker} исключён — вчера уже упал (лидер падения)")
+                print(f"[AI] ФИЛЬТР: {ticker} — вчера лидер падения")
                 continue
-
-            # Правило: НЕ лонговать то что вчера уже выросло сильно
             if direction == "LONG" and ticker in yesterday_risers:
-                print(f"[AI] ФИЛЬТР: {ticker} исключён — вчера уже вырос (лидер роста)")
+                print(f"[AI] ФИЛЬТР: {ticker} — вчера лидер роста")
                 continue
 
-            # Проверяем корректность тейка/стопа
             entry = trade["entry"]
-            take = trade["take"]
-            stop = trade["stop"]
-
             if direction == "SHORT":
-                # Для шорта: тейк должен быть НИЖЕ входа, стоп ВЫШЕ
-                if take >= entry or stop <= entry:
-                    # Пересчитываем
-                    trade["take"] = round(entry * 0.989, 2)  # -1.1%
-                    trade["stop"] = round(entry * 1.003, 2)  # +0.3%
-            else:
-                # Для лонга: тейк ВЫШЕ входа, стоп НИЖЕ
-                if take <= entry or stop >= entry:
-                    trade["take"] = round(entry * 1.011, 2)  # +1.1%
-                    trade["stop"] = round(entry * 0.997, 2)  # -0.3%
-
-            # Проверяем что стоп не слишком узкий (минимум 0.2%)
-            if direction == "SHORT":
-                stop_pct = (trade["stop"] - entry) / entry * 100
-            else:
-                stop_pct = (entry - trade["stop"]) / entry * 100
-
-            if stop_pct < 0.2:
-                # Стоп слишком узкий — расширяем до 0.3%
-                if direction == "SHORT":
+                if trade["take"] >= entry or trade["stop"] <= entry:
+                    trade["take"] = round(entry * 0.989, 2)
                     trade["stop"] = round(entry * 1.003, 2)
-                else:
+            else:
+                if trade["take"] <= entry or trade["stop"] >= entry:
+                    trade["take"] = round(entry * 1.011, 2)
                     trade["stop"] = round(entry * 0.997, 2)
 
             filtered.append(trade)
-
         return filtered
 
     def _determine_direction(self, response: str) -> str:
-        """Определяет общее направление из ответа LLM."""
-        response_upper = response.upper()
-        if "НАПРАВЛЕНИЕ: ШОРТ" in response_upper or "НАПРАВЛЕНИЕ: SHORT" in response_upper:
+        """Определяет направление из ответа."""
+        upper = response.upper()
+        if "НАПРАВЛЕНИЕ: ШОРТ" in upper or "НАПРАВЛЕНИЕ: SHORT" in upper:
             return "SHORT"
-        elif "НАПРАВЛЕНИЕ: ЛОНГ" in response_upper or "НАПРАВЛЕНИЕ: LONG" in response_upper:
+        elif "НАПРАВЛЕНИЕ: ЛОНГ" in upper or "НАПРАВЛЕНИЕ: LONG" in upper:
             return "LONG"
-        elif "ЗАБОР" in response_upper:
+        elif "ЗАБОР" in upper:
             return "FENCE"
         return "UNKNOWN"
 
+    def _extract_logic(self, response: str) -> str:
+        """Извлекает логику из ответа."""
+        match = re.search(r'ЛОГИКА:\s*(.+?)(?:\n|СДЕЛКА)', response, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()[:200]
+        return ""
+
+    # Обратная совместимость
+    def morning_analysis(self, channel_data, market_data, previous_day_data, paranorm_bars):
+        """Обратная совместимость с main.py."""
+        return self.morning_plan(channel_data, market_data, previous_day_data, paranorm_bars)
+
     def format_trades_message(self) -> str:
-        """Форматирует сделки для отправки в Telegram."""
-        if not self.today_trades:
-            return "🤖 Нет сделок на сегодня"
-
-        direction_emoji = {"SHORT": "🔴", "LONG": "🟢", "FENCE": "🟡"}
-        direction_text = {"SHORT": "ШОРТ", "LONG": "ЛОНГ", "FENCE": "ЗАБОР"}
-
-        msg = f"🤖 <b>AI РЕКОМЕНДАЦИИ</b>\n\n"
-        msg += f"Направление: {direction_emoji.get(self.daily_direction, '⚪')} "
-        msg += f"<b>{direction_text.get(self.daily_direction, '?')}</b>\n\n"
-
-        for i, trade in enumerate(self.today_trades, 1):
-            d = "🔴" if trade["direction"] == "SHORT" else "🟢"
-            ticker = trade["ticker"]
-            entry = trade["entry"]
-            take = trade["take"]
-            stop = trade["stop"]
-            take_pct = abs(take - entry) / entry * 100
-            stop_pct = abs(stop - entry) / entry * 100
-
-            msg += f"{d} <b>СДЕЛКА {i}:</b> "
-            msg += f"{'ШОРТ' if trade['direction'] == 'SHORT' else 'ЛОНГ'} {ticker}\n"
-            msg += f"   Вход: {entry} | Тейк: {take} (+{take_pct:.1f}%) | Стоп: {stop} (-{stop_pct:.1f}%)\n\n"
-
-        msg += f"<i>Всего сделок: {len(self.today_trades)}/{self.max_trades_per_day}</i>"
-        return msg
-
-
-# Импорт re в начало файла
-import re
+        """Обратная совместимость."""
+        return self.format_plan_message()
