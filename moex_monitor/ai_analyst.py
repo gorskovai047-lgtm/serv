@@ -130,6 +130,7 @@ class AIAnalyst:
             "SMLT": ["самолет", "самолёт"], "VKCO": ["вк"],
             "RNFT": ["русснефть"], "CHMF": ["северсталь"],
             "YNDX": ["яндекс"], "PLZL": ["полюс"],
+            "AFKS": ["система", "афк"], "POSI": ["позитив"],
         }
         aliases = ticker_aliases.get(ticker, [ticker.lower()])
         dir_word = "шорт" if direction == "SHORT" else "лонг"

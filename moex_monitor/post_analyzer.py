@@ -61,6 +61,8 @@ TICKER_ALIASES = {
     "сегежа": "SGZH", "sgzh": "SGZH",
     "совкомфлот": "FLOT", "flot": "FLOT",
     "банк спб": "BSPB", "бспб": "BSPB", "bspb": "BSPB",
+    "система": "AFKS", "афк система": "AFKS", "afks": "AFKS",
+    "позитив": "POSI", "positive": "POSI", "posi": "POSI",
 }
 
 
