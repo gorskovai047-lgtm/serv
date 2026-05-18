@@ -14,6 +14,7 @@ import os
 import sys
 import asyncio
 import signal
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -24,6 +25,7 @@ from channel_parser import ChannelParser
 from post_analyzer import PostAnalyzer
 from atr_monitor import ATRMonitor
 from notifier import TelegramNotifier
+from ai_analyst import AIAnalyst
 
 MSK = timezone(timedelta(hours=3))
 
@@ -36,6 +38,7 @@ class MOEXMonitorBot:
         self.analyzer = PostAnalyzer()
         self.atr_monitor = ATRMonitor()
         self.notifier = TelegramNotifier()
+        self.ai_analyst = AIAnalyst()
 
         self._running = False
         self._monitoring_task: Optional[asyncio.Task] = None
@@ -43,6 +46,7 @@ class MOEXMonitorBot:
 
         self.today_analysis: Optional[dict] = None
         self.today_tickers: list = []
+        self.today_ai_trades: list = []
 
     async def start(self):
         """Запуск всей системы."""
@@ -97,7 +101,7 @@ class MOEXMonitorBot:
         print("[Main] Остановлено")
 
     async def _morning_routine(self):
-        """Утренняя рутина: парсинг канала, анализ постов."""
+        """Утренняя рутина: парсинг канала, анализ постов, AI рекомендации."""
         print(f"\n[Main] === Утренняя рутина ({datetime.now(MSK).strftime('%H:%M')}) ===")
 
         try:
@@ -122,14 +126,139 @@ class MOEXMonitorBot:
 
             await self.notifier.notify_morning_analysis(self.today_analysis)
 
+            # === AI АНАЛИТИК ===
+            await self._run_ai_analysis(posts)
+
             print(
                 f"[Main] Утренний анализ: "
                 f"{len(self.today_analysis['levels'])} уровней, "
-                f"{len(self.today_tickers)} тикеров"
+                f"{len(self.today_tickers)} тикеров, "
+                f"{len(self.today_ai_trades)} AI-сделок"
             )
         except Exception as e:
             print(f"[Main] Ошибка утренней рутины: {e}")
             await self.notifier.notify_error(f"Утренняя рутина: {e}")
+
+    async def _run_ai_analysis(self, posts: list):
+        """Запуск AI-аналитика с данными из канала и рынка."""
+        try:
+            # Собираем текст из канала
+            channel_text = "\n".join([p.get("text", "") for p in posts if p.get("text")])
+            channel_data = {
+                "raw_text": channel_text[:3000],
+                "levels_text": channel_text[:2000],
+            }
+
+            # Получаем рыночные данные
+            market_data = await self._get_market_background()
+
+            # Получаем данные предыдущего дня
+            previous_day_data = await self._get_previous_day_data()
+
+            # Определяем паранорм бары
+            paranorm_bars = []
+            for ticker, data in previous_day_data.items():
+                if data.get("open") and data["open"] > 0:
+                    range_pct = (data["high"] - data["low"]) / data["open"] * 100
+                    if range_pct > 2.0:
+                        paranorm_bars.append(f"{ticker} ({range_pct:.1f}%)")
+
+            # Вызываем AI
+            result = self.ai_analyst.morning_analysis(
+                channel_data, market_data, previous_day_data, paranorm_bars
+            )
+
+            self.today_ai_trades = result.get("trades", [])
+
+            # Отправляем результат
+            if self.today_ai_trades:
+                msg = self.ai_analyst.format_trades_message()
+                await self.notifier.send_message(msg)
+                if result.get("filtered_out", 0) > 0:
+                    await self.notifier.send_message(
+                        f"⚠️ Отфильтровано {result['filtered_out']} сделок "
+                        f"(вчерашние лидеры падения/роста)"
+                    )
+            else:
+                await self.notifier.send_message(
+                    "🤖 AI: Нет чётких сделок. Совокупность факторов неоднозначна."
+                )
+
+            print(f"[AI] Направление: {result.get('direction')}, "
+                  f"Сделок: {len(self.today_ai_trades)}")
+
+        except Exception as e:
+            print(f"[AI] Ошибка AI-анализа: {e}")
+            await self.notifier.send_message(f"⚠️ AI-анализ не удался: {e}")
+
+    async def _get_market_background(self) -> dict:
+        """Получить фон рынка (нефть, фьючерсы)."""
+        import urllib.request
+        import json as json_lib
+
+        result = {}
+        try:
+            url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json?iss.only=marketdata"
+            resp = urllib.request.urlopen(url, timeout=10)
+            data = json_lib.loads(resp.read())
+            cols = data["marketdata"]["columns"]
+            for row in data["marketdata"]["data"]:
+                d = dict(zip(cols, row))
+                secid = d.get("SECID", "")
+                if secid.startswith("BR-") and d.get("LASTCHANGEPRCNT"):
+                    result["oil_change"] = f"{d['LASTCHANGEPRCNT']:+.1f}%"
+                elif secid.startswith("Si-") and d.get("LASTCHANGEPRCNT"):
+                    result["usd_change"] = f"{d['LASTCHANGEPRCNT']:+.1f}%"
+                elif secid.startswith("GD-") and d.get("LASTCHANGEPRCNT"):
+                    result["gold_change"] = f"{d['LASTCHANGEPRCNT']:+.1f}%"
+                elif secid.startswith("MX-") and d.get("LAST"):
+                    result["mx_price"] = d["LAST"]
+        except Exception as e:
+            print(f"[Market] Ошибка получения фона: {e}")
+
+        result.setdefault("oil_change", "?")
+        result.setdefault("usd_change", "?")
+        result.setdefault("gold_change", "?")
+        result.setdefault("mx_price", "?")
+        result.setdefault("global_indices", "нет данных")
+        return result
+
+    async def _get_previous_day_data(self) -> dict:
+        """Получить данные предыдущего торгового дня."""
+        import urllib.request
+        import json as json_lib
+
+        result = {}
+        # Ищем последний торговый день (не выходной)
+        today = datetime.now(MSK).date()
+        prev_day = today - timedelta(days=1)
+        while prev_day.weekday() >= 5:  # Пропускаем выходные
+            prev_day -= timedelta(days=1)
+
+        date_str = prev_day.strftime("%Y-%m-%d")
+
+        for ticker in Config.MOEX_INDEX_TICKERS[:25]:  # Топ-25
+            try:
+                url = (
+                    f"https://iss.moex.com/iss/engines/stock/markets/shares/"
+                    f"securities/{ticker}/candles.json?"
+                    f"from={date_str}&till={date_str}&interval=24"
+                )
+                resp = urllib.request.urlopen(url, timeout=5)
+                data = json_lib.loads(resp.read())
+                candles = data["candles"]["data"]
+                if candles:
+                    c = candles[-1]
+                    result[ticker] = {
+                        "open": c[0],
+                        "close": c[1],
+                        "high": c[2],
+                        "low": c[3],
+                    }
+            except Exception:
+                pass
+
+        return result
 
     async def _monitoring_loop(self):
         """Основной цикл мониторинга ATR (10:00-18:40 МСК)."""
@@ -205,6 +334,9 @@ class MOEXMonitorBot:
         self.notifier.reset_daily()
         self.today_analysis = None
         self.today_tickers = []
+        self.today_ai_trades = []
+        self.ai_analyst.today_trades = []
+        self.ai_analyst.daily_direction = None
         print("[Main] Новый день: данные сброшены")
 
     @staticmethod
@@ -256,6 +388,8 @@ class MOEXMonitorBot:
             await self._cmd_status()
         elif text == "/levels":
             await self._cmd_levels()
+        elif text == "/trades":
+            await self._cmd_trades()
         elif text == "/summary":
             await self._cmd_summary()
         elif text in ("/help", "/start"):
@@ -326,14 +460,32 @@ class MOEXMonitorBot:
             "🤖 *MOEX Monitor — Команды:*\n\n"
             "/status — статус ATR\n"
             "/levels — уровни на сегодня\n"
+            "/trades — AI-сделки на сегодня\n"
             "/summary — полная сводка\n"
             "/ticker SBER — детали по тикеру\n"
             "/help — справка\n\n"
             "📡 *Автоматика:*\n"
-            "• 07:15 — разбор из канала\n"
-            "• 10:00-18:40 — мониторинг ATR\n"
-            "• 18:45 — вечерняя сводка"
+            "• 06:00 — AI-анализ + парсинг канала\n"
+            "• 07:00-14:00 — мониторинг + сигналы\n"
+            "• 14:00+ — только мониторинг\n"
+            "• 18:45 — вечерняя сводка\n\n"
+            "🧠 *Правила AI:*\n"
+            "• Тейк +0.9-1.5%, стоп -0.3%\n"
+            "• Не шортит вчерашних лидеров падения\n"
+            "• Не лонгует вчерашних лидеров роста\n"
+            "• 'Лонг' в плане + общий шорт = контртренд"
         )
+        await self.notifier.send_message(text)
+
+    async def _cmd_trades(self):
+        """Показать текущие AI-сделки."""
+        if self.today_ai_trades:
+            msg = self.ai_analyst.format_trades_message()
+            await self.notifier.send_message(msg)
+        else:
+            await self.notifier.send_message(
+                "🤖 AI-сделок нет. Появятся после утреннего анализа (~06:00 МСК)."
+            )
         await self.notifier.send_message(text)
 
 

@@ -17,8 +17,11 @@ class Config:
     CHANNEL = os.getenv("TELEGRAM_CHANNEL", "https://t.me/D_LAKTIONOV_LIVE")
     CHANNEL_USERNAME = "D_LAKTIONOV_LIVE"
 
-    # OpenAI
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    # AI (Fireworks.ai / DeepSeek V4 Pro)
+    FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
+    FIREWORKS_MODEL = os.getenv(
+        "FIREWORKS_MODEL", "accounts/fireworks/models/deepseek-v4-pro"
+    )
 
     # ATR
     ATR_THRESHOLD_PERCENT = float(os.getenv("ATR_THRESHOLD_PERCENT", "1.0"))
