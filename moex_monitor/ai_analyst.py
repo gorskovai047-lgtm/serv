@@ -443,6 +443,7 @@ class AIAnalyst:
                     signals.append({"type": "TAKE_PROFIT", "ticker": ticker, "pnl": pnl, "price": price})
                 elif price >= stop:
                     trade["status"] = TradeStatus.STOP_LOSS.value
+                    trade["_stop_time"] = datetime.now(MSK)
                     pnl = -((price - entry) / entry * 100)
                     signals.append({"type": "STOP_LOSS", "ticker": ticker, "pnl": pnl, "price": price})
             else:  # LONG
@@ -452,10 +453,161 @@ class AIAnalyst:
                     signals.append({"type": "TAKE_PROFIT", "ticker": ticker, "pnl": pnl, "price": price})
                 elif price <= stop:
                     trade["status"] = TradeStatus.STOP_LOSS.value
+                    trade["_stop_time"] = datetime.now(MSK)
                     pnl = -((entry - price) / entry * 100)
                     signals.append({"type": "STOP_LOSS", "ticker": ticker, "pnl": pnl, "price": price})
 
         return signals
+
+    # ═══════════════════════════════════════════════════
+    # ПЕРЕЗАХОД ПОСЛЕ СТОПА
+    # ═══════════════════════════════════════════════════
+
+    def check_reentry(
+        self,
+        current_prices: Dict,
+        atr_status: Dict,
+        time_msk: datetime,
+    ) -> List[Dict]:
+        """
+        Проверка возможности перезахода после стопа.
+        
+        Логика Лактионова:
+        - Если стоп сработал на ЛОЖНОМ выносе (без объёма, шпилька),
+          и цена вернулась в нашу сторону — ПЕРЕЗАХОДИМ.
+        - Перезаход только 1 раз (не бесконечно).
+        - Перезаход только до 14:00 МСК.
+        - ATR должен быть < 60% (ещё есть запас хода).
+        - Цена должна вернуться НИЖЕ стопа (для шорта) после выноса.
+        
+        Условия перезахода:
+        1. Сделка закрыта по стопу (status = STOP_LOSS)
+        2. Прошло 5-15 минут после стопа
+        3. Цена вернулась в направлении сделки (вынос = ложный)
+        4. Дневное направление не изменилось
+        5. Перезаход ещё не делался по этой сделке
+        6. ATR < 60%
+        """
+        signals = []
+        hour = time_msk.hour
+
+        # Не перезаходим после 14:00
+        if hour >= 14:
+            return signals
+
+        # Не перезаходим если направление поменялось
+        if not self.daily_direction or self.daily_direction == "FENCE":
+            return signals
+
+        for trade in self.today_trades:
+            # Только стопнутые сделки
+            if trade.get("status") != TradeStatus.STOP_LOSS.value:
+                continue
+
+            # Перезаход только 1 раз
+            if trade.get("_reentry_done", False):
+                continue
+
+            # Проверяем что прошло достаточно времени (через _stop_time)
+            stop_time = trade.get("_stop_time")
+            if stop_time:
+                elapsed = (time_msk - stop_time).total_seconds()
+                if elapsed < 300:  # Минимум 5 минут
+                    continue
+                if elapsed > 1800:  # Максимум 30 минут
+                    continue
+
+            ticker = trade["ticker"]
+            direction = trade["direction"]
+
+            if ticker not in current_prices:
+                continue
+
+            price = current_prices[ticker]
+            original_entry = trade["entry"]
+            original_stop = trade["stop"]
+
+            # Проверяем ATR
+            ticker_atr = atr_status.get(ticker, {})
+            atr_used_pct = ticker_atr.get("atr_used_pct", 0)
+            if atr_used_pct > 60:
+                continue  # ATR уже 60%+ — не стоит перезаходить
+
+            # Проверяем что цена ВЕРНУЛАСЬ в нашу сторону
+            # Для шорта: цена должна быть НИЖЕ оригинального входа
+            # (т.е. вынос вверх был ложным, цена откатилась)
+            reentry_confirmed = False
+
+            if direction == "SHORT":
+                # Цена ниже оригинального входа = вынос был ложный
+                if price < original_entry:
+                    reentry_confirmed = True
+            elif direction == "LONG":
+                # Цена выше оригинального входа = вынос был ложный
+                if price > original_entry:
+                    reentry_confirmed = True
+
+            if not reentry_confirmed:
+                continue
+
+            # Лимит активных сделок
+            active_count = len([t for t in self.today_trades
+                              if t.get("status") in (TradeStatus.CONFIRMED.value, TradeStatus.ACTIVE.value)])
+            if active_count >= self.max_trades_per_day:
+                continue
+
+            # ПЕРЕЗАХОДИМ!
+            trade["_reentry_done"] = True
+
+            new_entry = price
+            if direction == "SHORT":
+                new_take = round(new_entry * 0.989, 2)
+                new_stop = round(new_entry * 1.003, 2)
+            else:
+                new_take = round(new_entry * 1.011, 2)
+                new_stop = round(new_entry * 0.997, 2)
+
+            reentry_trade = {
+                "type": "REENTRY",
+                "direction": direction,
+                "ticker": ticker,
+                "entry": new_entry,
+                "take": new_take,
+                "stop": new_stop,
+                "status": TradeStatus.ACTIVE.value,
+                "score": trade.get("score", 3),
+                "reason": f"Перезаход после ложного выноса (стоп {original_stop:.2f})",
+                "time": time_msk.strftime("%H:%M"),
+                "_reentry_done": True,  # Не перезаходим дважды
+            }
+
+            self.today_trades.append(reentry_trade)
+
+            signals.append({
+                "type": "REENTRY",
+                "direction": direction,
+                "ticker": ticker,
+                "entry": new_entry,
+                "take": new_take,
+                "stop": new_stop,
+                "reason": f"Ложный вынос отработан. Цена вернулась к {new_entry:.2f}",
+                "atr_remaining": f"{100 - atr_used_pct:.0f}%",
+                "time": time_msk.strftime("%H:%M"),
+            })
+
+        return signals
+
+    def format_reentry_signal(self, signal: Dict) -> str:
+        """Форматирует сигнал перезахода для Telegram."""
+        d = "🔴" if signal["direction"] == "SHORT" else "🟢"
+        msg = f"🔄 <b>ПЕРЕЗАХОД ({signal['time']})</b>\n\n"
+        msg += f"{d} <b>{signal['ticker']}</b> "
+        msg += f"{'ШОРТ' if signal['direction'] == 'SHORT' else 'ЛОНГ'}\n"
+        msg += f"   Вход: {signal['entry']} | Тейк: {signal['take']} | Стоп: {signal['stop']}\n"
+        msg += f"   Причина: {signal['reason']}\n"
+        msg += f"   ATR остаток: {signal['atr_remaining']}\n"
+        msg += f"   <i>⚠️ Перезаход — максимум 1 раз по инструменту</i>\n"
+        return msg
 
     # ═══════════════════════════════════════════════════
     # ФОРМАТИРОВАНИЕ СООБЩЕНИЙ

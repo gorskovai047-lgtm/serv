@@ -321,6 +321,14 @@ class MOEXMonitorBot:
             await self.notifier.send_message(msg)
             print(f"[Trade] {sig['type']} {sig['ticker']} {sig['pnl']:+.2f}%")
 
+        # 2.5. Проверка перезахода после ложного выноса
+        if now.hour < 14:
+            reentry_signals = self.ai_analyst.check_reentry(current_prices, atr_status, now)
+            for sig in reentry_signals:
+                msg = self.ai_analyst.format_reentry_signal(sig)
+                await self.notifier.send_message(msg)
+                print(f"[Reentry] 🔄 {sig['direction']} {sig['ticker']} от {sig['entry']}")
+
         # 3. ATR мониторинг
         await self._check_atr()
 
