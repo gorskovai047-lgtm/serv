@@ -126,6 +126,10 @@ class AIAnalyst:
             "OZON": ["озон"], "TCSG": ["тиньков", "тинькофф"],
             "AFLT": ["аэрофлот"], "MAGN": ["ммк"], "NLMK": ["нлмк"],
             "MGNT": ["магнит"], "ALRS": ["алроса"], "TATN": ["татнефть"],
+            "UGLD": ["югк", "южуралзолото"], "MTLR": ["мечел"],
+            "SMLT": ["самолет", "самолёт"], "VKCO": ["вк"],
+            "RNFT": ["русснефть"], "CHMF": ["северсталь"],
+            "YNDX": ["яндекс"], "PLZL": ["полюс"],
         }
         aliases = ticker_aliases.get(ticker, [ticker.lower()])
         dir_word = "шорт" if direction == "SHORT" else "лонг"

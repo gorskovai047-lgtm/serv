@@ -74,7 +74,7 @@ class Config:
     MAX_TRADES_PER_DAY = 8
     MIN_ATR_REMAINING_PCT = 30  # Мин остаток ATR для входа
 
-    # Тикеры акций индекса ММВБ (основные)
+    # Тикеры акций индекса ММВБ (основные + доп. ликвидные)
     MOEX_INDEX_TICKERS = [
         "SBER", "GAZP", "LKOH", "GMKN", "NVTK",
         "ROSN", "YNDX", "MTSS", "MGNT", "ALRS",
@@ -83,4 +83,13 @@ class Config:
         "RUAL", "IRAO", "FEES", "HYDR", "AFLT",
         "PIKK", "OZON", "TCSG", "FIVE", "MAGN",
         "NLMK", "SBRF", "TRNFP", "RTKM", "CBOM",
+        # Дополнительные (Лактионов торгует):
+        "UGLD",   # ЮГК (Южуралзолото)
+        "MTLR",   # Мечел
+        "SMLT",   # Самолёт
+        "VKCO",   # ВК
+        "RNFT",   # Русснефть
+        "SGZH",   # Сегежа
+        "FLOT",   # Совкомфлот
+        "BSPB",   # Банк СПб
     ]

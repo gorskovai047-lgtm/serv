@@ -52,6 +52,15 @@ TICKER_ALIASES = {
     "мкб": "CBOM", "cbom": "CBOM",
     "ммвб": "IMOEX", "imoex": "IMOEX", "индекс": "IMOEX",
     "индекс мосбиржи": "IMOEX",
+    # Дополнительные тикеры Лактионова:
+    "югк": "UGLD", "южуралзолото": "UGLD", "ugld": "UGLD",
+    "мечел": "MTLR", "mtlr": "MTLR",
+    "самолет": "SMLT", "самолёт": "SMLT", "smlt": "SMLT",
+    "вк": "VKCO", "vkco": "VKCO", "vk": "VKCO",
+    "русснефть": "RNFT", "rnft": "RNFT",
+    "сегежа": "SGZH", "sgzh": "SGZH",
+    "совкомфлот": "FLOT", "flot": "FLOT",
+    "банк спб": "BSPB", "бспб": "BSPB", "bspb": "BSPB",
 }
 
 
