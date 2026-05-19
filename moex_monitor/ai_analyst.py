@@ -779,9 +779,9 @@ class AIAnalyst:
                 trades.append({
                     "direction": direction,
                     "ticker": match.group(2).upper(),
-                    "entry": float(match.group(3).replace(",", ".")),
-                    "take": float(match.group(4).replace(",", ".")),
-                    "stop": float(match.group(5).replace(",", ".")),
+                    "entry": float(match.group(3).replace(",", ".").rstrip(".")),
+                    "take": float(match.group(4).replace(",", ".").rstrip(".")),
+                    "stop": float(match.group(5).replace(",", ".").rstrip(".")),
                 })
         return trades
 

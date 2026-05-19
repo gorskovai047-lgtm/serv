@@ -181,67 +181,82 @@ class PostAnalyzer:
         """Извлекает уровни поддержки и сопротивления из текста."""
         levels = []
 
-        support_patterns = [
-            r'подд(?:ержка|\.)?[:\s]+(\d+[\.,]?\d*)',
-            r'support[:\s]+(\d+[\.,]?\d*)',
-            r'лоу[:\s]+(\d+[\.,]?\d*)',
-            r'мин(?:имум)?[:\s]+(\d+[\.,]?\d*)',
+        # Парсим формат Лактионова: "ТИКЕР цена шорт/лонг сопр ЦЕНА - ЦЕНА под ЦЕНА"
+        # Пример: "ВТБ 91 лонг под 90 - 89"
+        # Пример: "Тиньков 309 шорт сопр 310 - 313"
+        laktionov_pattern = re.compile(
+            r'(?:^|\n)\s*(?:▪️\s*)?'  # начало строки или ▪️
+            r'([А-Яа-яA-Za-z]+\w*)\s+'  # тикер (русское/английское слово)
+            r'([\d.,]+)\s*'  # цена
+            r'(?:шорт|лонг)?\s*'  # направление (опционально)
+            r'(?:сопр\s+([\d.,\s\-–—]+))?\s*'  # сопротивление (опционально)
+            r'(?:под\s+([\d.,\s\-–—]+))?',  # поддержка (опционально)
+            re.IGNORECASE | re.MULTILINE
+        )
+
+        for match in laktionov_pattern.finditer(text):
+            ticker_name = match.group(1).lower().strip()
+            # Определяем тикер
+            ticker = TICKER_ALIASES.get(ticker_name)
+            if not ticker:
+                continue
+
+            # Основная цена
+            try:
+                main_price = float(match.group(2).replace(",", ".").rstrip("."))
+            except (ValueError, TypeError):
+                continue
+
+            # Сопротивление
+            if match.group(3):
+                sopr_text = match.group(3)
+                sopr_prices = re.findall(r'(\d+[\.,]?\d*)', sopr_text)
+                for sp in sopr_prices:
+                    try:
+                        price = float(sp.replace(",", ".").rstrip("."))
+                        if price > 0:
+                            levels.append({
+                                "date": date_str, "ticker": ticker,
+                                "level_type": "resistance", "price": price,
+                                "source_post_id": post_id,
+                            })
+                    except ValueError:
+                        pass
+
+            # Поддержка
+            if match.group(4):
+                pod_text = match.group(4)
+                pod_prices = re.findall(r'(\d+[\.,]?\d*)', pod_text)
+                for pp in pod_prices:
+                    try:
+                        price = float(pp.replace(",", ".").rstrip("."))
+                        if price > 0:
+                            levels.append({
+                                "date": date_str, "ticker": ticker,
+                                "level_type": "support", "price": price,
+                                "source_post_id": post_id,
+                            })
+                    except ValueError:
+                        pass
+
+        # Fallback: простые паттерны для ММВБ/индекса
+        imoex_patterns = [
+            r'ммвб[:\s]+(\d+[\.,]?\d*)',
+            r'по\s+ммвб\s+(?:это\s+)?(\d{4}[\.,]?\d*)',
         ]
-
-        resistance_patterns = [
-            r'сопр(?:отивление|\.)?[:\s]+(\d+[\.,]?\d*)',
-            r'resistance[:\s]+(\d+[\.,]?\d*)',
-            r'хай[:\s]+(\d+[\.,]?\d*)',
-            r'макс(?:имум)?[:\s]+(\d+[\.,]?\d*)',
-            r'цель[:\s]+(\d+[\.,]?\d*)',
-        ]
-
-        text_lower = text.lower()
-
-        for pattern in support_patterns:
-            matches = re.findall(pattern, text_lower)
-            for match in matches:
-                price = float(match.replace(",", "."))
-                if price > 0:
-                    levels.append({
-                        "date": date_str,
-                        "ticker": tickers[0] if tickers else "IMOEX",
-                        "level_type": "support",
-                        "price": price,
-                        "source_post_id": post_id,
-                    })
-
-        for pattern in resistance_patterns:
-            matches = re.findall(pattern, text_lower)
-            for match in matches:
-                price = float(match.replace(",", "."))
-                if price > 0:
-                    levels.append({
-                        "date": date_str,
-                        "ticker": tickers[0] if tickers else "IMOEX",
-                        "level_type": "resistance",
-                        "price": price,
-                        "source_post_id": post_id,
-                    })
-
-        # Диапазоны: "2750 - 2800"
-        range_pattern = r'(\d{3,6}[\.,]?\d*)\s*[-\u2013\u2014]\s*(\d{3,6}[\.,]?\d*)'
-        ranges = re.findall(range_pattern, text)
-        for low, high in ranges:
-            low_price = float(low.replace(",", "."))
-            high_price = float(high.replace(",", "."))
-            if low_price > 0 and high_price > low_price:
-                ticker = tickers[0] if tickers else "IMOEX"
-                levels.append({
-                    "date": date_str, "ticker": ticker,
-                    "level_type": "support", "price": low_price,
-                    "source_post_id": post_id,
-                })
-                levels.append({
-                    "date": date_str, "ticker": ticker,
-                    "level_type": "resistance", "price": high_price,
-                    "source_post_id": post_id,
-                })
+        for pattern in imoex_patterns:
+            matches = re.findall(pattern, text.lower())
+            for m in matches:
+                try:
+                    price = float(m.replace(",", ".").rstrip("."))
+                    if 2000 < price < 4000:  # Разумный диапазон IMOEX
+                        levels.append({
+                            "date": date_str, "ticker": "IMOEX",
+                            "level_type": "support", "price": price,
+                            "source_post_id": post_id,
+                        })
+                except ValueError:
+                    pass
 
         return levels
 
